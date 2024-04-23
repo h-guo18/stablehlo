@@ -13,6 +13,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <unordered_set>
+#include <memory>
 
 #define MAX_NUM_OPS 8
 using namespace std;
@@ -24,6 +25,25 @@ enum class OpType {
     Divide,
     // Add more operation types here
 };
+
+void print_dense_attr(mlir::DenseElementsAttr attr) {
+    // Get the type of elements stored in the attribute
+    auto type = attr.getType().cast<mlir::ShapedType>();
+    
+    // Check the element type and print accordingly
+    if (type.getElementType().isF32()) {
+        // For floating point elements, print each value
+        for (float value : attr.getValues<float>()) {
+            std::cout << value << " ";
+        }
+    } else if (type.getElementType().isInteger(32)) {
+        // For 32-bit integer elements, print each value
+        for (int32_t value : attr.getValues<int32_t>()) {
+            std::cout << value << " ";
+        }
+    }
+    std::cout << std::endl; // End the line after printing all elements
+}
 
 class GraphNode{
     public:
@@ -47,32 +67,53 @@ class OPnode: public GraphNode{
 
 class TensorNode: public GraphNode{
     public:
+        mlir::DenseElementsAttr dense_attr;
         int argument_idx;   // Indicate the index of this tensor in mlir function arguments
-        TensorNode(string name,int arg_idx):GraphNode(name),argument_idx(arg_idx){
+        TensorNode(string name, vector<float> value,  mlir::MLIRContext* context):GraphNode(name){
             is_ts_input=true; //mark that it's a tensor nodes
-            }
+            auto tensorType = mlir::RankedTensorType::get({2, 2}, mlir::FloatType::getF32(context));
+            //create a mlir attribute with its value
+            dense_attr=mlir::DenseElementsAttr::get(tensorType, llvm::ArrayRef<float>(value));         
+        }
+        void print(){
+            print_dense_attr(this->dense_attr);
+        }
 
 };
 
 class Graph{
     public:
-        Graph():numNodes(0){};
-        void push_op(GraphNode* node){
+        Graph():num_ops(0){};
+        void push_op(OPnode* node){
             //push operation with no input
-            nodes.push_back(node);
-            numNodes ++;
+            op_nodes.push_back(node);
+            num_ops ++;
         }
-        void push_op(GraphNode* node,GraphNode* input1){
+        void push_op(OPnode* node,GraphNode* input1){
             //push op with one input
-            nodes.push_back(node);
-            numNodes ++;
+            op_nodes.push_back(node);
+            num_ops ++;
+            //for unseen tensor inputs, record it and assign a unique index to it
+            if(input1->is_ts_input && graph_inputs.find(((TensorNode*)input1)->name)== graph_inputs.end()){
+                ((TensorNode*)input1)->argument_idx = graph_inputs.size();
+                graph_inputs[((TensorNode*)input1)->name] = (TensorNode*)input1;
+            }
             node->predecessors.push_back(input1);
             input1->successors.push_back(node);
         }
-        void push_op(GraphNode* node,GraphNode* input1, GraphNode* input2){
+        void push_op(OPnode* node,GraphNode* input1, GraphNode* input2){
             //push op with two inputs
-            nodes.push_back(node);
-            numNodes ++;
+            op_nodes.push_back(node);
+            num_ops ++;
+            //for unseen tensor inputs, record it and assign a unique index to it
+            if(input1->is_ts_input && graph_inputs.find(((TensorNode*)input1)->name)== graph_inputs.end() ){
+                ((TensorNode*)input1)->argument_idx = graph_inputs.size();
+                graph_inputs[((TensorNode*)input1)->name] = (TensorNode*)input1;
+            }
+            if(input2->is_ts_input  && graph_inputs.find(((TensorNode*)input2)->name)== graph_inputs.end()){
+                ((TensorNode*)input2)->argument_idx = graph_inputs.size();
+                graph_inputs[((TensorNode*)input2)->name] = (TensorNode*)input2;
+            }
             node->predecessors.push_back(input1);
             input1->successors.push_back(node);
             node->predecessors.push_back(input2);
@@ -81,17 +122,17 @@ class Graph{
 
         OPnode* get_exit_op(){
             //find and return the exit operation node in the graph
-            vector<GraphNode*> res;
-            for(GraphNode* node : nodes){
+            vector<OPnode*> res;
+            for(OPnode* node : op_nodes){
                 if(node->successors.empty()) res.push_back(node);
             }
             assert(res.size()==1);
-            return (OPnode*)(res[0]);
+            return res[0];
         }
         vector<OPnode*> get_entry_ops(){
             //find and return the entry operation in the graph (i.e. OpNodes whose inputs only contains TensorNode, but not OPnode.)
             vector<OPnode*> res;
-            for(GraphNode* node : nodes){
+            for(OPnode* node : op_nodes){
                 bool is_entry = true;
                 for(GraphNode* pred:node->predecessors){
                     if (!pred->is_ts_input){
@@ -99,13 +140,13 @@ class Graph{
                         break;
                     }
                 }
-                if(is_entry) res.push_back((OPnode*)node);
+                if(is_entry) res.push_back(node);
             }
             return res;
         }
         void print(){
             //print the graph in string format
-            if(numNodes<=0) {
+            if(num_ops<=0) {
                 printf("empty graph.\n");
                 return;
             }
@@ -129,7 +170,7 @@ class Graph{
             return res;
         }
         mlir::Operation* create_operation(mlir::OpBuilder& builder,mlir::Location& loc,llvm::SmallVector<mlir::Value, 2>& arguments,OPnode* node){
-            //helper function for build_graph()
+            //helper function for _build_mlir()
             switch(node->optype){
                 case(OpType::Add):
                     return builder.create<mlir::stablehlo::AddOp>(loc, arguments)
@@ -149,10 +190,11 @@ class Graph{
                         .getOperation();
             }
         }
-        mlir::Operation* build_graph(vector<OPnode*> entrys, mlir::OpBuilder& builder,mlir::Location& loc,llvm::SmallVector<mlir::Value, 4>& graph_inputs){
+        mlir::Operation* _build_mlir(vector<OPnode*> entrys, mlir::OpBuilder& builder,mlir::Location& loc,llvm::SmallVector<mlir::Value, 3>& graph_inputs){
             //build the whole graph given entry points. First create entry operations, then create their successors.
             mlir::Operation* latest_op; // keep track of the latest created op, so we know the exit operation;
             unordered_set<OPnode*> created{};
+            //first create entry nodes
             for(OPnode* node:entrys){
                 llvm::SmallVector<mlir::Value, 2> node_inputs;
                 for(GraphNode* pred:node->predecessors){
@@ -164,10 +206,9 @@ class Graph{
                 node->mlir_op = latest_op;
                 created.insert(node);
             }
-            while(created.size()<this->nodes.size()){
-                for(GraphNode* node:this->nodes){
-                    if(node->is_ts_input ||(created.find((OPnode*)node)!=created.end())) continue;
-
+            //Iteratively create ir for nodes whose predecessors are all created
+            while(created.size()<this->op_nodes.size()){
+                for(OPnode* node:this->op_nodes){
                     bool all_pred_op_created = true;
                     llvm::SmallVector<mlir::Value, 2> node_inputs = {};
                     for(GraphNode* pred:node->predecessors){
@@ -184,17 +225,16 @@ class Graph{
                         }
                     }
                     if(all_pred_op_created){
-                        latest_op=create_operation(builder,loc,node_inputs,(OPnode*)node);
-                        ((OPnode*)node)->mlir_op = latest_op;
-                        created.insert((OPnode*)node);
+                        latest_op=create_operation(builder,loc,node_inputs,node);
+                        node->mlir_op = latest_op;
+                        created.insert(node);
                     }
                 }
             }
             return latest_op;
         }
-        void to_mlir(){
-            //call build_graph() to convert graph to mlir format, then print the mlir module.
-            mlir::MLIRContext context;
+        mlir::OwningOpRef<mlir::ModuleOp> to_mlir(mlir::MLIRContext& context){
+            //call _build_mlir() to convert graph to mlir format, then print the mlir module.
             mlir::OwningOpRef<mlir::ModuleOp> module = mlir::ModuleOp::create(mlir::UnknownLoc::get(&context));
             module->getContext()->loadDialect<mlir::func::FuncDialect>();
             module->getContext()->loadDialect<mlir::stablehlo::StablehloDialect>();
@@ -204,9 +244,9 @@ class Graph{
             /** create function **/
             // create function argument and result types.
             auto tensorType =
-                mlir::RankedTensorType::get({3, 4}, mlir::FloatType::getF32(&context));
+                mlir::RankedTensorType::get({2, 2}, mlir::FloatType::getF32(&context));
             auto func_type =
-                mlir::FunctionType::get(&context, {tensorType, tensorType,tensorType,tensorType}, {tensorType});
+                mlir::FunctionType::get(&context, {tensorType, tensorType,tensorType}, {tensorType});
 
             // create the function and map arguments.
             llvm::ArrayRef<mlir::NamedAttribute> attrs;
@@ -216,7 +256,7 @@ class Graph{
 
             // create function block with add operations.
             mlir::Block* block = function.addEntryBlock();
-            llvm::SmallVector<mlir::Value, 4> arguments(block->args_begin(),
+            llvm::SmallVector<mlir::Value, 3> arguments(block->args_begin(),
                                                         block->args_end());
             mlir::OpBuilder block_builder = mlir::OpBuilder::atBlockEnd(block);
             mlir::Location loc = block_builder.getUnknownLoc();
@@ -224,39 +264,55 @@ class Graph{
             llvm::SmallVector<mlir::NamedAttribute, 10> attributes;
             vector<OPnode*> entrys = get_entry_ops();
 
-            mlir::Operation* exit_op =  build_graph(entrys,block_builder,loc,arguments);
+            mlir::Operation* exit_op =  _build_mlir(entrys,block_builder,loc,arguments);
             block_builder.create<mlir::func::ReturnOp>(loc, exit_op->getResult(0));
-            (*module).dump();
-            return;
+            return module;
+        }
+
+        llvm::SmallVector<mlir::DenseElementsAttr> execute(mlir::MLIRContext& context, mlir::OwningOpRef<mlir::ModuleOp>& mod){
+            llvm::SmallVector<mlir::DenseElementsAttr, 3> input_args;
+            for(std::pair<string,TensorNode*> p : this->graph_inputs){
+                input_args.push_back(p.second->dense_attr);
+            }
+            mlir::stablehlo::InterpreterConfiguration config;
+            auto results = evalModule(*mod, input_args, config);
+            return (*results);
         }
 
     public:
-        vector<GraphNode*> nodes;
-        int numNodes;
+        vector<OPnode*> op_nodes;
+        map<string,TensorNode*> graph_inputs;
+        int num_ops;
 };
-
 
 //unit test
 int main(){
-    TensorNode x("x",0);//create a tensor named x, corespond to the 0th argument of mlir function
-    TensorNode y("y",1);
-    TensorNode z("z",2);
+    //define inputs and operations
+    mlir::MLIRContext context;
+    TensorNode x("x",{3,5,7,9},&context);//create a 4-element tensor named x
+    TensorNode y("y",{1,1,1,1},&context);
+    TensorNode z("z",{2,4,6,8},&context);
+    printf("x: "); x.print();
+    printf("y: "); y.print();
+    printf("z: "); z.print();
     OPnode op1(OpType::Subtract,"subtract");//create a operation op1 named "subtract"
     OPnode op2(OpType::Multiply,"mult");
-    OPnode op3(OpType::Divide,"divide");
+    OPnode op3(OpType::Add,"add");
     
-
+    //construct a simple compututation graph
     Graph g1;
     g1.push_op(&op1,&x,&y);//add operation op1, with lhs operand x and rhs operand y 
-    g1.print();
     g1.push_op(&op2,&op1,&z); //add operation op2, with lhs operand = output of op1, and rhs oprand z
-    g1.print();
-    g1.push_op(&op3,&x,&op2);
-    g1.print(); 
-    g1.to_mlir();//create mlir and dump it to stderr
-    
-    
+    g1.push_op(&op3,&y,&op2);
+    printf("graph: "); g1.print(); 
 
+    //convert graph to mlir 
+    auto mod= g1.to_mlir(context);//create mlir and dump it to stderr
+    mod->dump();
+
+    //execute converted mlir
+    auto res = g1.execute(context,mod);
+    printf("output: "); print_dense_attr(res[0]);
 
     return 0;
 }
