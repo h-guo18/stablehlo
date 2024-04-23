@@ -47,13 +47,10 @@ class OPnode: public GraphNode{
 
 class TensorNode: public GraphNode{
     public:
-        mlir::DenseElementsAttr value;
-        TensorNode(string name):GraphNode(name){
+        int argument_idx;   // Indicate the index of this tensor in mlir function arguments
+        TensorNode(string name,int arg_idx):GraphNode(name),argument_idx(arg_idx){
             is_ts_input=true; //mark that it's a tensor nodes
             }
-        bool operator==(const TensorNode& node2) const {
-            return (value == node2.value);
-        }
 
 };
 
@@ -131,7 +128,7 @@ class Graph{
             }
             return res;
         }
-        mlir::Operation* create_operation(mlir::OpBuilder& builder,mlir::Location& loc,llvm::SmallVector<mlir::Value, 4>& arguments,OPnode* node){
+        mlir::Operation* create_operation(mlir::OpBuilder& builder,mlir::Location& loc,llvm::SmallVector<mlir::Value, 2>& arguments,OPnode* node){
             //helper function for build_graph()
             switch(node->optype){
                 case(OpType::Add):
@@ -157,7 +154,13 @@ class Graph{
             mlir::Operation* latest_op; // keep track of the latest created op, so we know the exit operation;
             unordered_set<OPnode*> created{};
             for(OPnode* node:entrys){
-                latest_op = create_operation(builder,loc,graph_inputs,node);
+                llvm::SmallVector<mlir::Value, 2> node_inputs;
+                for(GraphNode* pred:node->predecessors){
+                    assert(pred->is_ts_input);
+                    node_inputs.push_back(graph_inputs[((TensorNode*) pred)->argument_idx]);
+                }
+
+                latest_op = create_operation(builder,loc,node_inputs,node);
                 node->mlir_op = latest_op;
                 created.insert(node);
             }
@@ -166,10 +169,10 @@ class Graph{
                     if(node->is_ts_input ||(created.find((OPnode*)node)!=created.end())) continue;
 
                     bool all_pred_op_created = true;
-                    llvm::SmallVector<mlir::Value, 4> node_inputs = {};
+                    llvm::SmallVector<mlir::Value, 2> node_inputs = {};
                     for(GraphNode* pred:node->predecessors){
                         if (pred->is_ts_input){
-                            node_inputs.push_back(graph_inputs[0]);
+                            node_inputs.push_back(graph_inputs[((TensorNode*)pred)->argument_idx]);
                             continue;
                         }else{
                             //OPnode predecessor
@@ -203,7 +206,7 @@ class Graph{
             auto tensorType =
                 mlir::RankedTensorType::get({3, 4}, mlir::FloatType::getF32(&context));
             auto func_type =
-                mlir::FunctionType::get(&context, {tensorType, tensorType}, {tensorType});
+                mlir::FunctionType::get(&context, {tensorType, tensorType,tensorType,tensorType}, {tensorType});
 
             // create the function and map arguments.
             llvm::ArrayRef<mlir::NamedAttribute> attrs;
@@ -222,7 +225,7 @@ class Graph{
             vector<OPnode*> entrys = get_entry_ops();
 
             mlir::Operation* exit_op =  build_graph(entrys,block_builder,loc,arguments);
-            // block_builder.create<mlir::func::ReturnOp>(loc, op->getResult(0));
+            block_builder.create<mlir::func::ReturnOp>(loc, exit_op->getResult(0));
             (*module).dump();
             return;
         }
@@ -235,12 +238,13 @@ class Graph{
 
 //unit test
 int main(){
-    TensorNode x1("x1");
-    TensorNode x2("x2");
-    TensorNode x3("x3");
+    TensorNode x0("x0",0);
+    TensorNode x1("x1",1);
+    TensorNode x2("x2",2);
     OPnode op1(OpType::Subtract,"subtract");
     OPnode op2(OpType::Multiply,"mult");
     OPnode op3(OpType::Divide,"divide");
+    
 
     Graph g1;
     g1.push_op(&op1,&x1,&x2);
@@ -249,7 +253,7 @@ int main(){
     g1.print();
     g1.push_op(&op3,&x1,&op2);
     g1.print();
-    for(GraphNode* node:g1.get_entry_ops()) std::cout << node->name <<std::endl;
+    // for(GraphNode* node:g1.get_entry_ops()) std::cout << node->name <<std::endl;
     g1.to_mlir();
     
     
