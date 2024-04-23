@@ -40,6 +40,7 @@ class GraphNode{
 class OPnode: public GraphNode{
     public:
         OpType optype;
+        mlir::Operation* mlir_op;
         OPnode(OpType type,string name):GraphNode(name),optype(type){};
 };
 
@@ -151,12 +152,42 @@ class Graph{
                         .getOperation();
             }
         }
-        mlir::Operation* build_graph(vector<OPnode*> entrys, mlir::OpBuilder& builder,mlir::Location& loc,llvm::SmallVector<mlir::Value, 4>& arguments,){
+        mlir::Operation* build_graph(vector<OPnode*> entrys, mlir::OpBuilder& builder,mlir::Location& loc,llvm::SmallVector<mlir::Value, 4>& graph_inputs){
             //build the whole graph given entry points. First create entry operations, then create their successors.
+            mlir::Operation* latest_op; // keep track of the latest created op, so we know the exit operation;
             unordered_set<OPnode*> created{};
             for(OPnode* node:entrys){
-                mlir::Operation* op = create_operation(block_builder,loc,arguments,node);
+                latest_op = create_operation(builder,loc,graph_inputs,node);
+                node->mlir_op = latest_op;
+                created.insert(node);
             }
+            while(created.size()<this->nodes.size()){
+                for(GraphNode* node:this->nodes){
+                    if(node->is_ts_input ||(created.find((OPnode*)node)!=created.end())) continue;
+
+                    bool all_pred_op_created = true;
+                    llvm::SmallVector<mlir::Value, 4> node_inputs = {};
+                    for(GraphNode* pred:node->predecessors){
+                        if (pred->is_ts_input){
+                            node_inputs.push_back(graph_inputs[0]);
+                            continue;
+                        }else{
+                            //OPnode predecessor
+                            if(created.find((OPnode*)pred)==created.end()){
+                                all_pred_op_created = false;
+                                break;
+                            }
+                            node_inputs.push_back(((OPnode*)pred)->mlir_op->getResult(0));
+                        }
+                    }
+                    if(all_pred_op_created){
+                        latest_op=create_operation(builder,loc,node_inputs,(OPnode*)node);
+                        ((OPnode*)node)->mlir_op = latest_op;
+                        created.insert((OPnode*)node);
+                    }
+                }
+            }
+            return latest_op;
         }
         void to_mlir(){
             //call build_graph() to convert graph to mlir format, then print the mlir module.
