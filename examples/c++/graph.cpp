@@ -238,23 +238,22 @@ class Graph{
 
 //unit test
 int main(){
-    TensorNode x0("x0",0);
-    TensorNode x1("x1",1);
-    TensorNode x2("x2",2);
-    OPnode op1(OpType::Subtract,"subtract");
+    TensorNode x("x",0);//create a tensor named x, corespond to the 0th argument of mlir function
+    TensorNode y("y",1);
+    TensorNode z("z",2);
+    OPnode op1(OpType::Subtract,"subtract");//create a operation op1 named "subtract"
     OPnode op2(OpType::Multiply,"mult");
     OPnode op3(OpType::Divide,"divide");
     
 
     Graph g1;
-    g1.push_op(&op1,&x1,&x2);
+    g1.push_op(&op1,&x,&y);//add operation op1, with lhs operand x and rhs operand y 
     g1.print();
-    g1.push_op(&op2,&op1,&x3); 
+    g1.push_op(&op2,&op1,&z); //add operation op2, with lhs operand = output of op1, and rhs oprand z
     g1.print();
-    g1.push_op(&op3,&x1,&op2);
-    g1.print();
-    // for(GraphNode* node:g1.get_entry_ops()) std::cout << node->name <<std::endl;
-    g1.to_mlir();
+    g1.push_op(&op3,&x,&op2);
+    g1.print(); 
+    g1.to_mlir();//create mlir and dump it to stderr
     
     
 
