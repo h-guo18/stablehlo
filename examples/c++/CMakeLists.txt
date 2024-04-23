@@ -27,3 +27,17 @@ add_custom_target(example-add-test
     example-add
 )
 add_dependencies(check-stablehlo-quick example-add-test)
+
+
+add_executable(graph-test graph-test.cpp)
+llvm_update_compile_flags(graph-test)
+target_link_libraries(graph-test PRIVATE StablehloOps StablehloReferenceApi)
+
+mlir_check_all_link_libraries(graph-test)
+
+
+add_executable(graph graph.cpp)
+llvm_update_compile_flags(graph)
+target_link_libraries(graph PRIVATE StablehloOps StablehloReferenceApi)
+
+mlir_check_all_link_libraries(graph)

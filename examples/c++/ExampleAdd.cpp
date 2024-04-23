@@ -22,6 +22,8 @@ limitations under the License.
 #include "stablehlo/reference/Api.h"
 
 int main() {
+  std::vector<float> values{12,23,42,12};
+  std::vector<float> values2{24,46,84,24};
   mlir::MLIRContext context;
 
   /** create module **/
@@ -35,7 +37,7 @@ int main() {
   /** create function **/
   // create function argument and result types.
   auto tensorType =
-      mlir::RankedTensorType::get({3, 4}, mlir::FloatType::getF32(&context));
+      mlir::RankedTensorType::get({2, 2}, mlir::FloatType::getF32(&context));
   auto func_type =
       mlir::FunctionType::get(&context, {tensorType, tensorType}, {tensorType});
 
@@ -53,27 +55,31 @@ int main() {
   mlir::OpBuilder block_builder = mlir::OpBuilder::atBlockEnd(block);
   mlir::Location loc = block_builder.getUnknownLoc();
 
-  llvm::SmallVector<mlir::NamedAttribute, 10> attributes;
+//   llvm::SmallVector<mlir::NamedAttribute, 10> attributes;
   mlir::Operation* op =
-      block_builder.create<mlir::stablehlo::AddOp>(loc, arguments, attributes)
+      block_builder.create<mlir::stablehlo::AddOp>(loc, arguments[0],arguments[0])
           .getOperation();
-  block_builder.create<mlir::func::ReturnOp>(loc, op->getResult(0));
+  mlir::Operation* op2 =
+      block_builder.create<mlir::stablehlo::AddOp>(loc, arguments[1],op->getResult(0))
+          .getOperation();
+  block_builder.create<mlir::func::ReturnOp>(loc, op2->getResult(0));
 
   /** verify and dump the module **/
   assert(mlir::succeeded(mlir::verify(module.get())));
 
   /* interpret the function "main" with concrete inputs **/
-  auto getConstValue = [&](double val) {
-    return mlir::DenseElementsAttr::get(
-        tensorType,
-        block_builder.getFloatAttr(tensorType.getElementType(), val));
-  };
+//     auto getConstTensor = [&](float val) {
+//     // std::vector<float> values(2 * 2, val); // Fill the tensor with `val`
+//     return mlir::DenseElementsAttr::get(tensorType, llvm::ArrayRef<float>(values));
+//   };
 
-  auto inputValue1 = getConstValue(10.0);
-  auto inputValue2 = getConstValue(20.0);
-  auto expectedValue = getConstValue(30.0);
+  auto inputValue1 = mlir::DenseElementsAttr::get(tensorType, llvm::ArrayRef<float>(values));
+  auto inputValue2 = mlir::DenseElementsAttr::get(tensorType, llvm::ArrayRef<float>(values));
+  auto expectedValue = mlir::DenseElementsAttr::get(tensorType, llvm::ArrayRef<float>(values2));
 
   mlir::stablehlo::InterpreterConfiguration config;
+  (*module).dump();
   auto results = evalModule(*module, {inputValue1, inputValue2}, config);
+  if ((*results)[0] == expectedValue) printf("YESYESYES\n");
   return failed(results) || (*results)[0] != expectedValue;
 }

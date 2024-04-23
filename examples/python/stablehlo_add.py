@@ -18,20 +18,32 @@ import mlir.dialects.func as func
 from mlir.ir import Context, Location, InsertionPoint, Module
 import numpy as np
 
-with Context() as ctx, Location.unknown():
+
+myir = """
+func.func @test(%arg0: tensor<{0}>) -> tensor<{0}> {{
+  %0 = stablehlo.add %arg0, %arg0 : (tensor<{0}>, tensor<{0}>) -> tensor<{0}>
+  func.return %0 : tensor<{0}>
+}}
+""".format("f32")
+with Context() as ctx:
   stablehlo.register_dialect(ctx)
-  module = Module.create()
+  # module = Module.create()
+  module = Module.parse(myir)
 
-  with InsertionPoint(module.body):
+  # with InsertionPoint(module.body):
+  #   @func.func()
+  #   def main():
+  #     a_value = ir.DenseElementsAttr.get(np.zeros(shape=[3,4], dtype=np.int64))
+  #     b_value = ir.DenseElementsAttr.get(np.zeros(shape=[3,4], dtype=np.int64))
+  #     a = stablehlo.constant(a_value)
+  #     b = stablehlo.constant(b_value)
+  #     add = stablehlo.add(a, b)
+  #     # stablehlo.ReturnOp(add.owner)
+  #     return add
+      # stablehlo.ReturnOp(add.owner)
+    
 
-    @func.func()
-    def main():
-      a_value = ir.DenseElementsAttr.get(np.zeros(shape=[3,4], dtype=np.int64))
-      b_value = ir.DenseElementsAttr.get(np.zeros(shape=[3,4], dtype=np.int64))
-      a = stablehlo.constant(a_value)
-      b = stablehlo.constant(b_value)
-      add = stablehlo.add(a, b)
-      return add
-
-assert main.func_op.verify()
+  args = [ir.DenseIntElementsAttr.get(np.asarray(2, np.float32))]
+res = np.array(stablehlo.eval_module(module,args))
+print(res)
 print(str(module))
