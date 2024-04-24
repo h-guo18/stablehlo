@@ -78,7 +78,6 @@ class TensorNode: public GraphNode{
         void print(){
             print_dense_attr(this->dense_attr);
         }
-
 };
 
 class Graph{
@@ -129,21 +128,6 @@ class Graph{
             assert(res.size()==1);
             return res[0];
         }
-        vector<OPnode*> get_entry_ops(){
-            //find and return the entry operation in the graph (i.e. OpNodes whose inputs only contains TensorNode, but not OPnode.)
-            vector<OPnode*> res;
-            for(OPnode* node : op_nodes){
-                bool is_entry = true;
-                for(GraphNode* pred:node->predecessors){
-                    if (!pred->is_ts_input){
-                        is_entry = false;
-                        break;
-                    }
-                }
-                if(is_entry) res.push_back(node);
-            }
-            return res;
-        }
         void print(){
             //print the graph in string format
             if(num_ops<=0) {
@@ -190,50 +174,56 @@ class Graph{
                         .getOperation();
             }
         }
-        mlir::Operation* _build_mlir(vector<OPnode*> entrys, mlir::OpBuilder& builder,mlir::Location& loc,llvm::SmallVector<mlir::Value, 3>& graph_inputs){
+        mlir::Operation* _build_mlir(mlir::OpBuilder& builder,mlir::Location& loc, llvm::SmallVector<mlir::Value, 3>& tesnor_inputs){
             //build the whole graph given entry points. First create entry operations, then create their successors.
-            mlir::Operation* latest_op; // keep track of the latest created op, so we know the exit operation;
-            unordered_set<OPnode*> created{};
-            //first create entry nodes
-            for(OPnode* node:entrys){
-                llvm::SmallVector<mlir::Value, 2> node_inputs;
-                for(GraphNode* pred:node->predecessors){
-                    assert(pred->is_ts_input);
-                    node_inputs.push_back(graph_inputs[((TensorNode*) pred)->argument_idx]);
+            std::queue<GraphNode*> q;
+            unordered_set<GraphNode*> visited;
+            unordered_map<GraphNode*, int> node_degree;
+            for (auto& node: op_nodes) {
+                for (auto& node_pred: node->predecessors) {
+                    if (!node_pred->is_ts_input) {
+                        node_degree[node] ++;
+                    }
+                }
+            }
+            for (auto& node: op_nodes) {
+                if (node_degree[node] == 0 && !node->is_ts_input) {
+                    visited.insert(node);
+                    q.push(node);
+                }
+            }
+            while(!q.empty()) {
+                auto node = q.front();
+                q.pop();
+
+                llvm::SmallVector<mlir::Value, 2> inputs;
+                for(GraphNode* pred: node->predecessors){
+                    if (pred->is_ts_input) {
+                        inputs.push_back(tensor_inputs[((TensorNode*) pred)->argument_idx]);
+                    } else {
+                        inputs.push_back(((OPnode*)pred)->mlir_op->getResult(0));
+                    }
                 }
 
-                latest_op = create_operation(builder,loc,node_inputs,node);
-                node->mlir_op = latest_op;
-                created.insert(node);
-            }
-            //Iteratively create ir for nodes whose predecessors are all created
-            while(created.size()<this->op_nodes.size()){
-                for(OPnode* node:this->op_nodes){
-                    bool all_pred_op_created = true;
-                    llvm::SmallVector<mlir::Value, 2> node_inputs = {};
-                    for(GraphNode* pred:node->predecessors){
-                        if (pred->is_ts_input){
-                            node_inputs.push_back(graph_inputs[((TensorNode*)pred)->argument_idx]);
-                            continue;
-                        }else{
-                            //OPnode predecessor
-                            if(created.find((OPnode*)pred)==created.end()){
-                                all_pred_op_created = false;
-                                break;
-                            }
-                            node_inputs.push_back(((OPnode*)pred)->mlir_op->getResult(0));
-                        }
-                    }
-                    if(all_pred_op_created){
-                        latest_op=create_operation(builder,loc,node_inputs,node);
-                        node->mlir_op = latest_op;
-                        created.insert(node);
+                node->mlir_op = create_operation(builder, loc, inputs, node);
+
+                for(GraphNode* succ: node->successors) {
+                    node_degree[succ] --;
+                    if (node_degree[succ] == 0 && visited.find(succ) == visited.end()) {
+                        q.push(succ);
+                        visited.insert(succ);
                     }
                 }
             }
-            return latest_op;
+            for (auto& node: op_nodes) {
+                if (node->successors.empty()) {
+                    return node->mlir_op;
+                }
+            }
+            return nullptr;
         }
-        mlir::OwningOpRef<mlir::ModuleOp> to_mlir(mlir::MLIRContext& context){
+
+        void to_mlir(mlir::MLIRContext& context){
             //call _build_mlir() to convert graph to mlir format, then print the mlir module.
             mlir::OwningOpRef<mlir::ModuleOp> module = mlir::ModuleOp::create(mlir::UnknownLoc::get(&context));
             module->getContext()->loadDialect<mlir::func::FuncDialect>();
@@ -262,56 +252,136 @@ class Graph{
             mlir::Location loc = block_builder.getUnknownLoc();
 
             llvm::SmallVector<mlir::NamedAttribute, 10> attributes;
-            vector<OPnode*> entrys = get_entry_ops();
 
-            mlir::Operation* exit_op =  _build_mlir(entrys,block_builder,loc,arguments);
+            mlir::Operation* exit_op =  _build_mlir(block_builder,loc);
             block_builder.create<mlir::func::ReturnOp>(loc, exit_op->getResult(0));
-            return module;
+
+            graph_module = module;
+
+            module->dump();
         }
 
-        llvm::SmallVector<mlir::DenseElementsAttr> execute(mlir::MLIRContext& context, mlir::OwningOpRef<mlir::ModuleOp>& mod){
+        llvm::SmallVector<mlir::DenseElementsAttr> execute(mlir::MLIRContext& context){
             llvm::SmallVector<mlir::DenseElementsAttr, 3> input_args;
             for(std::pair<string,TensorNode*> p : this->graph_inputs){
                 input_args.push_back(p.second->dense_attr);
             }
             mlir::stablehlo::InterpreterConfiguration config;
-            auto results = evalModule(*mod, input_args, config);
+            auto results = evalModule(*graph_module, input_args, config);
             return (*results);
         }
 
+        auto exit_node() {
+            for (auto& node: op_nodes) {
+                if (node->successors.empty()) {
+                    return node;
+                }
+            }
+            return nullptr;
+        }
     public:
+        mlir::OwningOpRef<mlir::ModuleOp>& graph_module;
         vector<OPnode*> op_nodes;
         map<string,TensorNode*> graph_inputs;
         int num_ops;
 };
 
+bool find_same_subgraph(GraphNode* gn1, GraphNode* gn2) {
+    if (gn1->is_ts_input != gn2->is_ts_input) {
+        return false;
+    }
+
+    if (gn1->is_ts_input) {
+        return ((TensorNode*)gn1)->name == ((TensorNode*)gn2)->name;
+    } else {
+        if (((OPnode*)gn1)->optype != ((OPnode*)gn2)->optype) {
+            return false;
+        }
+        if (((OPnode*)gn1)->predecessors.size() != ((OPnode*)gn2)->predecessors.size()) {
+            return false;
+        }
+        for (int i = 0; i < ((OPnode*)gn1)->predecessors.size(); i ++) {
+            if (!find_same_subgraph(((OPnode*)gn1)->predecessors[i], ((OPnode*)gn2)->predecessors[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+bool find_same_supergraph(GraphNode* gn1, GraphNode* gn2) {
+    if (gn1->is_ts_input != gn2->is_ts_input) {
+        return false;
+    }
+
+    int counter = 1; 
+    if (gn1->is_ts_input) {
+        return ((TensorNode*)gn1)->name == ((TensorNode*)gn2)->name;
+    } else {
+        for (int i = 0; i < ((OPnode*)gn1)->predecessors.size(); i ++) {
+            if (!find_same_subgraph(((OPnode*)gn1)->predecessors[i], ((OPnode*)gn2)->predecessors[i])) {
+                counter ++;
+            }
+        }
+        if (counter > 1) return false;
+        return true;
+    }
+
+    return false;
+} 
+
+bool variable_ordering() {
+    // TODO:
+    return true;
+}
+
+bool pass_checks(Graph& g1, Graph& g2) {
+    // Check if the two graphs are the same
+    for (auto& g1_node: g1.op_nodes) {
+        for (auto& g2_node: g2.op_nodes) {
+            if (find_same_supergraph(g1_node, g2_node)) {
+                return false;
+            }
+        }
+    }
+    
+    if (find_same_supergraph(g1.exit_node(), g2.exit_node())) {
+        return false;
+    }
+
+    // variable_ordering();
+
+    return true;
+}
+
 //unit test
 int main(){
     //define inputs and operations
     mlir::MLIRContext context;
-    TensorNode x("x",{3,5,7,9},&context);//create a 4-element tensor named x
-    TensorNode y("y",{1,1,1,1},&context);
-    TensorNode z("z",{2,4,6,8},&context);
-    printf("x: "); x.print();
-    printf("y: "); y.print();
-    printf("z: "); z.print();
-    OPnode op1(OpType::Subtract,"subtract");//create a operation op1 named "subtract"
-    OPnode op2(OpType::Multiply,"mult");
-    OPnode op3(OpType::Add,"add");
+    TensorNode* x = new TensorNode("x",{3,5,7,9},&context);//create a 4-element tensor named x
+    TensorNode* y = new TensorNode("y",{1,1,1,1},&context);
+    TensorNode* z = new TensorNode("z",{2,4,6,8},&context);
+    printf("x: "); x->print();
+    printf("y: "); y->print();
+    printf("z: "); z->print();
+    OPnode* op1 = new OPnode(OpType::Subtract,"subtract");//create a operation op1 named "subtract"
+    OPnode* op2 = new OPnode(OpType::Multiply,"mult");
+    OPnode* op3 = new OPnode(OpType::Add,"add");
     
     //construct a simple compututation graph
     Graph g1;
-    g1.push_op(&op1,&x,&y);//add operation op1, with lhs operand x and rhs operand y 
-    g1.push_op(&op2,&op1,&z); //add operation op2, with lhs operand = output of op1, and rhs oprand z
-    g1.push_op(&op3,&y,&op2);
+    g1.push_op(op1,x,y);//add operation op1, with lhs operand x and rhs operand y 
+    g1.push_op(op2,op1,z); //add operation op2, with lhs operand = output of op1, and rhs oprand z
+    g1.push_op(op3,y,op2);
     printf("graph: "); g1.print(); 
 
     //convert graph to mlir 
-    auto mod= g1.to_mlir(context);//create mlir and dump it to stderr
-    mod->dump();
-
+    g1.to_mlir(context);//create mlir and dump it to stderr
+    
     //execute converted mlir
-    auto res = g1.execute(context,mod);
+    auto res = g1.execute(context);
     printf("output: "); print_dense_attr(res[0]);
 
     return 0;
